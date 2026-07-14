@@ -3,23 +3,10 @@ from datetime import datetime, timezone
 from src.logger import get_logger
 from src.utils import maybe_await
 from src.sources import ALL_FETCHERS
-from src.validator import validate_lyrics_match   # single-result validator
+from src.validator import validate_lyrics_match
 
 logger = get_logger("fetch_controller")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Registry
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ── Fetcher ID map ──────────────────────────────────────────────────────────
-# IDs are stable — clients may send ?sequence=1,2,5 to pick sources.
-# Dead sources have been removed; add new ones at the end.
-#
-# DISABLED (tested dead 2026-06-23):
-#   SimpMusic (was 3) — 403 Forbidden
-#   Lyrics.ovh (was 5) — no results
-#   ChartLyrics (was 6) — XML API dead
-#   LyricsFreek (was 7) — DNS dead
 FETCHER_MAP = {
     1: "Genius",
     2: "LRCLIB",
@@ -30,12 +17,9 @@ FETCHER_MAP = {
     7: "SimpMusic",
 }
 
-# Synced-lyrics sequence: sources that natively return LRC timestamps
-DEFAULT_SYNCED_SEQUENCE = [2, 3, 4, 5, 6, 7]   # LRCLIB, YouTube, NetEase, Megalobiz, Musixmatch, SimpMusic
-# Plain-lyrics sequence: all active sources, Genius first for quality
+DEFAULT_SYNCED_SEQUENCE = [2, 3, 4, 5, 6, 7]
 DEFAULT_PLAIN_SEQUENCE  = [1, 2, 3, 4, 5, 6, 7]
-# Fast (parallel) mode: best two reliable synced sources
-FAST_MODE_SEQUENCE      = [2, 3]   # LRCLIB + YouTube
+FAST_MODE_SEQUENCE      = [2, 3]
 
 
 def _registry() -> dict:
@@ -58,10 +42,6 @@ def _err(msg: str) -> dict:
     return {"status": "error", "error": {"message": msg, "timestamp": _ts()}}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Single fetcher wrapper
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def fetch_with_timeout(
     api_name: str,
     fetcher,
@@ -70,7 +50,6 @@ async def fetch_with_timeout(
     timestamps: bool,
     timeout: int = 12,
 ) -> dict:
-    """Call one fetcher, return normalised dict. Never raises."""
     try:
         result = await asyncio.wait_for(
             maybe_await(fetcher.fetch, artist, song, timestamps=timestamps),
@@ -88,38 +67,14 @@ async def fetch_with_timeout(
         return {"api": api_name, "success": False, "reason": str(e)}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Parallel fetch  —  validate-before-cancel
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def fetch_lyrics_parallel(
     artist: str,
     song: str,
     timestamps: bool,
     fetcher_ids: list,
 ) -> tuple:
-    """
-    Race all fetchers in parallel. Validate each result as it arrives.
-
-    THE KEY FIX
-    -----------
-    OLD (broken):
-        LRCLIB returns wrong song → success=True
-            → ALL other tasks immediately CANCELLED
-            → validator runs → FAIL → error returned
-            → SimpMusic never got a chance
-
-    NEW (fixed):
-        LRCLIB returns wrong song → validate → FAIL
-            → log warning, keep all other tasks RUNNING
-        SimpMusic returns right song → validate → PASS
-            → NOW cancel remaining tasks → return winner
-
-    The cancel only happens after a result passes validation.
-    A failed validation never touches pending tasks.
-    """
-    reg   = _registry()
-    tasks = {}   # Task → api_name
+    reg = _registry()
+    tasks = {}
 
     for fid in fetcher_ids:
         if fid not in reg:
@@ -136,7 +91,7 @@ async def fetch_lyrics_parallel(
         return None, []
 
     all_attempts = []
-    pending      = set(tasks.keys())
+    pending = set(tasks.keys())
 
     while pending:
         done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
@@ -146,14 +101,11 @@ async def fetch_lyrics_parallel(
             all_attempts.append(attempt)
 
             if not attempt["success"]:
-                logger.debug(f"  [{attempt['api']}] skipped — {attempt.get('reason')}")
                 continue
 
-            # ── Validate BEFORE touching pending tasks ────────────────────
             val = validate_lyrics_match(artist, song, attempt["result"], threshold=0.75)
 
             if val["valid"]:
-                # ✓ Winner — safe to cancel now
                 logger.info(
                     f"✓ [{attempt['api']}] accepted "
                     f"(artist={val['artist_match']} song={val['song_match']} "
@@ -164,21 +116,14 @@ async def fetch_lyrics_parallel(
                 attempt["validation"] = val
                 return attempt["result"], all_attempts
 
-            else:
-                # ✗ Wrong result — DO NOT cancel, let siblings keep running
-                logger.warning(
-                    f"✗ [{attempt['api']}] rejected: {val['reason']} "
-                    f"— {len(pending)} fetcher(s) still running"
-                )
+            logger.warning(
+                f"✗ [{attempt['api']}] rejected: {val['reason']} "
+                f"— {len(pending)} fetcher(s) still running"
+            )
 
-    # All fetchers exhausted, nothing passed
     logger.warning(f"All fetchers exhausted — no valid result for '{artist} - {song}'")
     return None, all_attempts
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main controller
-# ─────────────────────────────────────────────────────────────────────────────
 
 async def fetch_lyrics_controller(
     artist_name: str,
@@ -188,19 +133,8 @@ async def fetch_lyrics_controller(
     sequence: str | None = None,
     fast_mode: bool = False,
 ) -> dict:
-    """
-    Parallel mode  (fast_mode or multi-fetcher custom sequence):
-        All fetchers run simultaneously.
-        Each result validated as it arrives — first valid result wins.
-
-    Sequential mode (default):
-        Fetchers run one at a time in order.
-        Each result validated before moving to the next.
-    """
-
-    # ── Resolve fetcher IDs ───────────────────────────────────────────────────
     if fast_mode:
-        fetcher_ids  = FAST_MODE_SEQUENCE
+        fetcher_ids = FAST_MODE_SEQUENCE
         use_parallel = True
         logger.info(f"Fast mode: '{artist_name} - {song_title}'")
 
@@ -217,32 +151,26 @@ async def fetch_lyrics_controller(
             or len(fetcher_ids) > _max_id
             or len(fetcher_ids) != len(set(fetcher_ids))
         ):
-            return _err(
-                f"Invalid sequence: must be unique numbers between 1 and {_max_id}"
-            )
+            return _err(f"Invalid sequence: must be unique numbers between 1 and {_max_id}")
 
         use_parallel = len(fetcher_ids) > 1
 
     else:
-        fetcher_ids  = DEFAULT_SYNCED_SEQUENCE if timestamps else DEFAULT_PLAIN_SEQUENCE
+        fetcher_ids = DEFAULT_SYNCED_SEQUENCE if timestamps else DEFAULT_PLAIN_SEQUENCE
         use_parallel = False
 
-    # ── Parallel path ─────────────────────────────────────────────────────────
+    # Parallel path
     if use_parallel:
-        result, attempts = await fetch_lyrics_parallel(
-            artist_name, song_title, timestamps, fetcher_ids
-        )
+        result, attempts = await fetch_lyrics_parallel(artist_name, song_title, timestamps, fetcher_ids)
 
         if result:
             response = {"status": "success", "data": result}
-            # Surface validation scores when match wasn't perfect
             for a in attempts:
                 if a.get("result") is result and a.get("validation"):
                     v = a["validation"]
                     if v["artist_match"] < 1.0 or v["song_match"] < 1.0:
                         response["validation"] = {
-                            k: v[k] for k in
-                            ("artist_match", "song_match", "reason", "script_mismatch")
+                            k: v[k] for k in ("artist_match", "song_match", "reason", "script_mismatch")
                         }
                     break
             return response
@@ -255,8 +183,8 @@ async def fetch_lyrics_controller(
             )
         return _err(f"No lyrics found for '{song_title}' by '{artist_name}'")
 
-    # ── Sequential path ───────────────────────────────────────────────────────
-    reg      = _registry()
+    # Sequential path (FIX: add timeouts per fetcher)
+    reg = _registry()
     attempts = []
 
     for fid in fetcher_ids:
@@ -268,35 +196,20 @@ async def fetch_lyrics_controller(
             attempts.append({"api": api_name, "status": "not_configured"})
             continue
 
-        try:
-            raw = await maybe_await(
-                fetcher.fetch, artist_name, song_title, timestamps=timestamps
-            )
+        attempt = await fetch_with_timeout(api_name, fetcher, artist_name, song_title, timestamps, timeout=12)
 
-            if not raw or not raw.get("lyrics"):
-                attempts.append({"api": api_name, "status": "no_lyrics"})
-                continue
+        if not attempt.get("success"):
+            attempts.append({"api": api_name, "status": attempt.get("reason", "failed")})
+            continue
 
-            val = validate_lyrics_match(artist_name, song_title, raw, threshold=0.75)
+        raw = attempt["result"]
+        val = validate_lyrics_match(artist_name, song_title, raw, threshold=0.75)
 
-            if val["valid"]:
-                logger.info(
-                    f"✓ [{api_name}] accepted "
-                    f"(artist={val['artist_match']} song={val['song_match']})"
-                )
-                return {"status": "success", "data": raw}
-            else:
-                logger.warning(
-                    f"✗ [{api_name}] rejected: {val['reason']} — trying next fetcher"
-                )
-                attempts.append({
-                    "api":    api_name,
-                    "status": "validation_failed",
-                    "reason": val["reason"],
-                })
+        if val["valid"]:
+            logger.info(f"✓ [{api_name}] accepted (artist={val['artist_match']} song={val['song_match']})")
+            return {"status": "success", "data": raw}
 
-        except Exception as e:
-            logger.error(f"[{api_name}] exception: {e}")
-            attempts.append({"api": api_name, "status": "error", "message": str(e)})
+        logger.warning(f"✗ [{api_name}] rejected: {val['reason']} — trying next fetcher")
+        attempts.append({"api": api_name, "status": "validation_failed", "reason": val["reason"]})
 
     return _err(f"No lyrics found for '{song_title}' by '{artist_name}'")
