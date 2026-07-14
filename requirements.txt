@@ -55,5 +55,7 @@ requests==2.32.3
 redis==5.0.6
 hiredis==2.3.2             # C parser for redis — much faster
 
+spotifyscraper==3.9.2
+
 # ── Optional: gevent worker for gunicorn (higher concurrency) ────────────────
 # gevent==24.2.1
