@@ -4,9 +4,19 @@ import os
 import asyncio
 import logging
 import httpx as _httpx
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
 from src.logger import get_logger
-from src.cache import make_cache_key, load_from_cache, save_to_cache, clear_cache, cache_stats
+from src.cache import (
+    make_cache_key,
+    load_from_cache,
+    save_to_cache,
+    clear_cache,
+    cache_stats,
+    get_or_fetch_coalesced,
+)
 from src.fetch_controller import fetch_lyrics_controller
 from src.sentiment_analyzer import analyze_sentiment, analyze_word_frequency, extract_lyrics_text
 from src.metadata_extractor import enhance_lyrics_with_metadata, get_metadata_only
@@ -18,6 +28,13 @@ logger = get_logger("router")
 
 # Initialize Trending Analytics Engine (global instance)
 trending_engine = TrendingAnalyticsEngine(cache_ttl_hours=24)
+
+# Background executor for metadata (best-effort)
+_META_BG_EXEC = ThreadPoolExecutor(max_workers=2)
+
+# Metadata time budget (seconds). Keep low so /lyrics doesn't stall.
+META_BUDGET_SECONDS = float(os.getenv("META_BUDGET_SECONDS", "4.0"))
+
 
 # Helper function to run async functions in sync context
 def run_async(coro, timeout=30):
@@ -219,7 +236,9 @@ def register_routes(app):
 
     @app.route("/lyrics/", methods=["GET"])
     def lyrics():
-        """Fetch lyrics with optional mood analysis and metadata"""
+        rid = str(uuid.uuid4())[:8]
+        t0 = time.perf_counter()
+
         artist = request.args.get("artist", "").strip()
         song = request.args.get("song", "").strip()
         country = request.args.get("country", "US").strip().upper()
@@ -234,31 +253,26 @@ def register_routes(app):
         include_metadata = request.args.get("metadata", "false").lower() == "true"
 
         if not artist or not song:
-            return (
-                jsonify({
-                    "status": "error",
-                    "error": {
-                        "message": "Artist and song name are required",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    },
-                }),
-                400,
-            )
+            return jsonify({
+                "status": "error",
+                "error": {
+                    "message": "Artist and song name are required",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            }), 400
 
         if pass_param and not sequence:
-            return (
-                jsonify({
-                    "status": "error",
-                    "error": {
-                        "message": "Sequence parameter is required when pass=true",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    },
-                }),
-                400,
-            )
+            return jsonify({
+                "status": "error",
+                "error": {
+                    "message": "Sequence parameter is required when pass=true",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            }), 400
 
         logger.info(
-            f"Lyrics request: {artist} - {song} (fast={fast_mode}, mood={analyze_mood}, metadata={include_metadata})"
+            f"[perf] rid={rid} Lyrics request: {artist} - {song} "
+            f"(fast={fast_mode}, mood={analyze_mood}, metadata={include_metadata})"
         )
 
         # Record user query for analytics
@@ -271,117 +285,153 @@ def register_routes(app):
         except Exception as e:
             logger.warning(f"Failed to record user query: {str(e)}")
 
-        # 1. Check Cache First
         cache_key = make_cache_key(artist, song, timestamps, sequence, fast_mode, analyze_mood, include_metadata)
-        cached = load_from_cache(cache_key)
 
-        if cached:
-            logger.info(f"Cache hit for {artist} - {song}")
-            return jsonify(cached)
+        # Start metadata in background (runs while lyrics fetching)
+        meta_future = None
+        if include_metadata:
+            meta_future = _META_BG_EXEC.submit(get_metadata_only, artist, song)
 
-        # 2. Fetch Fresh Data
-        try:
-            result = run_async(
-                fetch_lyrics_controller(
+        async def _resolve_stream():
+            try:
+                songs = await search_jiosaavn(f"{artist} {song}", limit=1)
+                if songs and songs[0].get("perma_url"):
+                    return await get_jiosaavn_stream(songs[0]["perma_url"])
+            except Exception:
+                return None
+            return None
+
+        def _should_cache(res: dict) -> bool:
+            if not isinstance(res, dict):
+                return False
+            if res.get("status") != "success":
+                return False
+            data = res.get("data", {}) or {}
+            return bool(data.get("lyrics") or data.get("plain_lyrics") or data.get("lyrics_text"))
+
+        def _compute():
+            nonlocal meta_future
+
+            # Fetch lyrics + stream in parallel (stream is useful for Swara)
+            t_lyrics0 = time.perf_counter()
+
+            async def _lyrics_and_stream():
+                lyrics_task = asyncio.create_task(fetch_lyrics_controller(
                     artist,
                     song,
                     timestamps=timestamps,
                     pass_param=pass_param,
                     sequence=sequence,
                     fast_mode=fast_mode,
-                ),
-                timeout=60
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout fetching lyrics for {artist} - {song}")
-            return (
-                jsonify({
-                    "status": "error",
-                    "error": {
-                        "message": "Request timed out",
-                        "details": "Lyrics fetch took too long",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    },
-                }),
-                504,
-            )
-        except Exception as e:
-            logger.error(f"Error fetching lyrics: {str(e)}")
-            return (
-                jsonify({
+                ))
+
+                stream_task = asyncio.create_task(_resolve_stream())
+
+                lyrics_res = await lyrics_task
+
+                try:
+                    stream_res = await asyncio.wait_for(stream_task, timeout=8.0)
+                except Exception:
+                    stream_res = None
+
+                return lyrics_res, stream_res
+
+            try:
+                result, stream_res = run_async(_lyrics_and_stream(), timeout=60)
+            except Exception as e:
+                logger.error(f"[perf] rid={rid} lyrics_fetch_error={e}")
+                return {
                     "status": "error",
                     "error": {
                         "message": "Failed to fetch lyrics",
                         "details": str(e),
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     },
-                }),
-                500,
-            )
+                }
 
-        if not isinstance(result, dict):
-            logger.error(f"Invalid result type from fetch_lyrics_controller: {type(result)}")
-            return (
-                jsonify({
+            t_lyrics = time.perf_counter() - t_lyrics0
+
+            if not isinstance(result, dict):
+                return {
                     "status": "error",
                     "error": {
                         "message": "Invalid response from lyrics fetcher",
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     },
-                }),
-                500,
+                }
+
+            # Mood analysis (CPU) — only if lyrics success
+            t_mood0 = time.perf_counter()
+            if analyze_mood and result.get("status") == "success":
+                data = result.get("data", {}) or {}
+                lyrics_text = extract_lyrics_text(data)
+
+                if lyrics_text:
+                    try:
+                        sentiment = analyze_sentiment(lyrics_text)
+                        word_freq = analyze_word_frequency(lyrics_text, top_n=5)
+                        result["mood_analysis"] = {
+                            "sentiment": sentiment,
+                            "top_words": word_freq,
+                        }
+                    except Exception as e:
+                        result["mood_analysis"] = {
+                            "error": "Unable to perform mood analysis",
+                            "details": str(e),
+                        }
+                else:
+                    result["mood_analysis"] = {"error": "Unable to extract lyrics for analysis"}
+            t_mood = time.perf_counter() - t_mood0
+
+            # Metadata (best-effort; do NOT block long)
+            t_meta0 = time.perf_counter()
+            if include_metadata and result.get("status") == "success":
+                try:
+                    meta_payload = None
+                    if meta_future:
+                        try:
+                            meta_payload = meta_future.result(timeout=META_BUDGET_SECONDS)
+                        except FuturesTimeout:
+                            meta_payload = None
+                        except Exception:
+                            meta_payload = None
+
+                    if meta_payload and isinstance(meta_payload, dict) and meta_payload.get("status") == "success":
+                        result["metadata"] = meta_payload.get("metadata", {})
+                    else:
+                        result.setdefault("metadata", {})
+                        result["metadata_error"] = "Metadata unavailable or timed out"
+
+                except Exception as e:
+                    result.setdefault("metadata", {})
+                    result["metadata_error"] = f"Could not retrieve metadata: {str(e)}"
+            t_meta = time.perf_counter() - t_meta0
+
+            # Attach stream URL under metadata (Swara expects stream_url/playable_url)
+            if result.get("status") == "success":
+                if stream_res and isinstance(stream_res, dict) and stream_res.get("stream_url"):
+                    result.setdefault("metadata", {})
+                    result["metadata"]["stream_url"] = stream_res["stream_url"]
+                    result["metadata"]["playable_url"] = stream_res["stream_url"]
+
+            total = time.perf_counter() - t0
+            logger.info(
+                f"[perf] rid={rid} total={total:.3f}s lyrics={t_lyrics:.3f}s mood={t_mood:.3f}s meta={t_meta:.3f}s "
+                f"fast={fast_mode} ts={timestamps} moodOn={analyze_mood} metaOn={include_metadata}"
             )
 
-        # 3. Analyze mood if requested
-        if analyze_mood and result.get("status") == "success":
-            data = result.get("data", {})
-            lyrics_text = extract_lyrics_text(data)
+            return result
 
-            if lyrics_text:
-                try:
-                    sentiment = analyze_sentiment(lyrics_text)
-                    word_freq = analyze_word_frequency(lyrics_text, top_n=5)
+        # Coalesced cache fetch (prevents thundering herd)
+        result, hit = get_or_fetch_coalesced(cache_key, _compute, should_cache=_should_cache)
 
-                    result["mood_analysis"] = {
-                        "sentiment": sentiment,
-                        "top_words": word_freq,
-                    }
-                    logger.info(f"Mood analysis completed for {artist} - {song}")
-                except Exception as e:
-                    logger.warning(f"Mood analysis failed: {str(e)}")
-                    result["mood_analysis"] = {
-                        "error": "Unable to perform mood analysis",
-                        "details": str(e),
-                    }
-            else:
-                logger.warning("Could not extract lyrics for mood analysis")
-                result["mood_analysis"] = {"error": "Unable to extract lyrics for analysis"}
+        if hit:
+            total = time.perf_counter() - t0
+            logger.info(f"[perf] rid={rid} cache_hit total={total:.3f}s")
 
-        # 4. Include metadata if requested
-        if include_metadata and result.get("status") == "success":
-            try:
-                metadata_result = enhance_lyrics_with_metadata(result, artist, song)
-                if asyncio.iscoroutine(metadata_result):
-                    metadata_result = run_async(metadata_result, timeout=30)
-                result = metadata_result
-                logger.info(f"Metadata enhanced for {artist} - {song}")
-            except Exception as e:
-                logger.warning(f"Metadata enhancement failed: {str(e)}")
-                result["metadata_error"] = f"Could not retrieve metadata: {str(e)}"
-
-        # 5. Cache if successful
-        if result.get("status") == "success":
-            data = result.get("data", {})
-            if data.get("lyrics") or data.get("plain_lyrics") or data.get("lyrics_text"):
-                try:
-                    save_to_cache(cache_key, result)
-                    logger.info(f"Result cached for {artist} - {song}")
-                except Exception as e:
-                    logger.warning(f"Cache save failed: {str(e)}")
-            else:
-                logger.warning(
-                    f"Fetch successful but no lyrics content found for {artist} - {song}. Skipping cache."
-                )
+        # Keep error contract stable
+        if isinstance(result, dict) and result.get("status") == "error":
+            return jsonify(result), 500
 
         return jsonify(result)
 
@@ -404,7 +454,7 @@ def register_routes(app):
             )
 
         logger.info(f"Metadata request for {artist} - {song}")
-        
+
         try:
             result = get_metadata_only(artist, song)
             if asyncio.iscoroutine(result):
@@ -456,7 +506,7 @@ def register_routes(app):
                 try:
                     country_enum = Country[country]
                     trending_songs = trending_engine.fetch_trending_songs(country_enum, limit)
-                    
+
                     return jsonify({
                         "status": "success",
                         "data": {
@@ -480,7 +530,7 @@ def register_routes(app):
             elif countries_param:
                 country_list = [c.strip().upper() for c in countries_param.split(",")]
                 trending_data = {}
-                
+
                 for c in country_list:
                     try:
                         country_enum = Country[c]
@@ -675,7 +725,7 @@ def register_routes(app):
     def jiosaavn_search():
         """Search for songs on JioSaavn"""
         query = request.args.get("q", "").strip()
-        
+
         if not query:
             return (
                 jsonify({
@@ -689,7 +739,7 @@ def register_routes(app):
             )
 
         logger.info(f"JioSaavn search query: {query}")
-        
+
         try:
             results = search_jiosaavn(query)
             if asyncio.iscoroutine(results):
@@ -726,7 +776,7 @@ def register_routes(app):
     def jiosaavn_play():
         """Get playable stream URL from JioSaavn"""
         song_link = request.args.get("songLink", "").strip()
-        
+
         if not song_link:
             return (
                 jsonify({
@@ -740,12 +790,12 @@ def register_routes(app):
             )
 
         logger.info(f"JioSaavn play request for: {song_link}")
-        
+
         try:
             data = get_jiosaavn_stream(song_link)
             if asyncio.iscoroutine(data):
                 data = run_async(data, timeout=30)
-            
+
             if not data or not isinstance(data, dict):
                 return (
                     jsonify({
@@ -916,7 +966,6 @@ def register_routes(app):
     @app.route("/cache/clear", methods=["POST"])
     def route_clear_cache():
         """Clear all cached data (Admin only)"""
-        # Require admin key via query param or header
         key = request.args.get("key") or request.headers.get("X-ADMIN-KEY")
         if not ADMIN_KEY or key != ADMIN_KEY:
             return (
