@@ -9,34 +9,36 @@ logger = get_logger("fetch_controller")
 
 # IDs stable
 FETCHER_MAP = {
-    1: "Genius",
-    2: "LRCLIB",
-    3: "YouTube Music",
-    4: "NetEase",
-    5: "Megalobiz",
-    6: "Musixmatch",
-    7: "SimpMusic",
-    8: "LyricsTape",
+    1: "SpotifyScraper",
+    2: "Genius",
+    3: "LRCLIB",
+    4: "YouTube Music",
+    5: "NetEase",
+    6: "Megalobiz",
+    7: "Musixmatch",
+    8: "SimpMusic",
+    9: "LyricsTape",
 }
 
-# Synced-lyrics sources (best effort)
-DEFAULT_SYNCED_SEQUENCE = [2, 3, 4, 5, 6, 7]   # LRCLIB, YouTube, NetEase, Megalobiz, Musixmatch, SimpMusic
-# Plain-lyrics sources (includes LyricsTape last-resort)
-DEFAULT_PLAIN_SEQUENCE  = [1, 2, 3, 4, 5, 6, 7, 8]
-# Fast mode (parallel) best two
-FAST_MODE_SEQUENCE      = [2, 3]   # LRCLIB + YouTube
+# Synced-lyrics sequence (primary -> fallbacks)
+DEFAULT_SYNCED_SEQUENCE = [1, 3, 4, 5, 6, 7, 8]   # SpotifyScraper, LRCLIB, YouTube, ...
+# Plain-lyrics sequence (Genius first, LyricsTape last)
+DEFAULT_PLAIN_SEQUENCE  = [2, 3, 4, 5, 6, 7, 8, 9]
+# Fast mode: race the top few
+FAST_MODE_SEQUENCE      = [1, 3, 4]   # SpotifyScraper + LRCLIB + YouTube
 
 
 def _registry() -> dict:
     return {
-        1: ("Genius",        ALL_FETCHERS.get("genius")),
-        2: ("LRCLIB",        ALL_FETCHERS.get("lrclib")),
-        3: ("YouTube Music", ALL_FETCHERS.get("youtube")),
-        4: ("NetEase",       ALL_FETCHERS.get("netease")),
-        5: ("Megalobiz",     ALL_FETCHERS.get("megalobiz")),
-        6: ("Musixmatch",    ALL_FETCHERS.get("musixmatch")),
-        7: ("SimpMusic",     ALL_FETCHERS.get("simpmusic")),
-        8: ("LyricsTape",    ALL_FETCHERS.get("lyricstape")),
+        1: ("SpotifyScraper", ALL_FETCHERS.get("spotify_scraper")),
+        2: ("Genius",         ALL_FETCHERS.get("genius")),
+        3: ("LRCLIB",         ALL_FETCHERS.get("lrclib")),
+        4: ("YouTube Music",  ALL_FETCHERS.get("youtube")),
+        5: ("NetEase",        ALL_FETCHERS.get("netease")),
+        6: ("Megalobiz",      ALL_FETCHERS.get("megalobiz")),
+        7: ("Musixmatch",     ALL_FETCHERS.get("musixmatch")),
+        8: ("SimpMusic",      ALL_FETCHERS.get("simpmusic")),
+        9: ("LyricsTape",     ALL_FETCHERS.get("lyricstape")),
     }
 
 
@@ -49,7 +51,6 @@ def _err(msg: str) -> dict:
 
 
 async def fetch_with_timeout(api_name, fetcher, artist, song, timestamps, timeout=12) -> dict:
-    """Call one fetcher, return normalised dict. Never raises."""
     try:
         result = await asyncio.wait_for(
             maybe_await(fetcher.fetch, artist, song, timestamps=timestamps),
@@ -65,7 +66,6 @@ async def fetch_with_timeout(api_name, fetcher, artist, song, timestamps, timeou
 
 
 async def fetch_lyrics_parallel(artist, song, timestamps, fetcher_ids) -> tuple:
-    """Parallel race; validate-before-cancel."""
     reg = _registry()
     tasks = {}
     for fid in fetcher_ids:
@@ -148,8 +148,8 @@ async def fetch_lyrics_controller(
 ) -> dict:
     """
     Hybrid logic:
-    - If timestamps requested: try synced first
-    - If synced fails: try plain (includes LyricsTape as last resort)
+    - timestamps=true: try synced first (SpotifyScraper -> others)
+    - if synced fails: try plain (Genius... -> LyricsTape)
     """
 
     # custom sequence
@@ -162,18 +162,16 @@ async def fetch_lyrics_controller(
         use_parallel = len(fetcher_ids) > 1
         res = await _run_sequence(artist_name, song_title, timestamps, fetcher_ids, use_parallel=use_parallel)
 
-        # If timestamps requested but failed, fallback to plain (no custom sequence)
         if timestamps and res.get("status") != "success":
             plain = await _run_sequence(artist_name, song_title, False, DEFAULT_PLAIN_SEQUENCE, use_parallel=False)
             if plain.get("status") == "success":
                 return plain
         return res
 
-    # fast mode (synced-first)
+    # fast mode
     if fast_mode:
         res = await _run_sequence(artist_name, song_title, timestamps, FAST_MODE_SEQUENCE, use_parallel=True)
         if timestamps and res.get("status") != "success":
-            # fallback to plain
             plain = await _run_sequence(artist_name, song_title, False, DEFAULT_PLAIN_SEQUENCE, use_parallel=False)
             if plain.get("status") == "success":
                 return plain
@@ -185,7 +183,6 @@ async def fetch_lyrics_controller(
         if synced.get("status") == "success":
             return synced
 
-        # fallback to plain (includes LyricsTape)
         plain = await _run_sequence(artist_name, song_title, False, DEFAULT_PLAIN_SEQUENCE, use_parallel=False)
         if plain.get("status") == "success":
             return plain
