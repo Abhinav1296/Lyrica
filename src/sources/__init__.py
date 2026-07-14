@@ -8,6 +8,14 @@ def _safe(name: str, cls):
         ALL_FETCHERS[name] = None
 
 
+# NEW: SpotifyScraper (primary synced)
+try:
+    from .spotify_scraper_fetcher import SpotifyScraperFetcher
+    _safe("spotify_scraper", SpotifyScraperFetcher)
+except Exception:
+    ALL_FETCHERS["spotify_scraper"] = None
+
+
 # Import fetchers (safe)
 try:
     from .genius_fetcher import GeniusFetcher
@@ -51,9 +59,10 @@ try:
 except Exception:
     ALL_FETCHERS["simpmusic"] = None
 
-# NEW: LyricsTape (plain-only fallback)
+# LyricsTape (plain-only fallback)
 try:
     from .lyricstape_fetcher import LyricsTapeFetcher
     _safe("lyricstape", LyricsTapeFetcher)
 except Exception:
     ALL_FETCHERS["lyricstape"] = None
+    
