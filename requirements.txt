@@ -52,8 +52,8 @@ anyio==4.4.0                 # async compatibility layer used by httpx
 requests==2.32.3
 
 # ── Optional: Redis backend for Flask-Limiter (recommended for production) ───
-# redis==5.0.6
-# hiredis==2.3.2             # C parser for redis — much faster
+redis==5.0.6
+hiredis==2.3.2             # C parser for redis — much faster
 
 # ── Optional: gevent worker for gunicorn (higher concurrency) ────────────────
 # gevent==24.2.1
