@@ -7,11 +7,22 @@ from difflib import SequenceMatcher
 from .base_fetcher import BaseFetcher, build_result
 
 
-# ---------- helpers ----------
-
-_TELUGU_UNICODE_RANGE = (0x0C00, 0x0C7F)  # Telugu script range
-
+# ------------------------------------------------------------------
+# Script ranges
+# ------------------------------------------------------------------
+# Telugu script
+_TELUGU_RANGE = (0x0C00, 0x0C7F)
+# Other Indic scripts we treat as "wrong language" signal for Telugu-first app
+_OTHER_INDIC_RANGES = [
+    (0x0900, 0x097F),  # Devanagari (Hindi/Marathi/Sanskrit)
+    (0x0A00, 0x0A7F),  # Gurmukhi (Punjabi)
+    (0x0B80, 0x0BFF),  # Tamil
+    (0x0C80, 0x0CFF),  # Kannada
+    (0x0D00, 0x0D7F),  # Malayalam
+    (0x0980, 0x09FF),  # Bengali
+]
 _TELUGU_HINTS = ("telugu", "tollywood")
+
 
 def _norm(s: str) -> str:
     if not s:
@@ -22,14 +33,38 @@ def _norm(s: str) -> str:
     return s.lower().strip()
 
 
-def _has_telugu_script(text: str) -> bool:
+def _script_stats(text: str) -> dict:
+    """
+    Count characters per relevant script.
+    """
+    telugu = 0
+    other_indic = 0
+    latin = 0
+    total = 0
     if not text:
-        return False
+        return {"telugu": 0, "other_indic": 0, "latin": 0, "total": 0}
+
     for ch in text:
         cp = ord(ch)
-        if _TELUGU_UNICODE_RANGE[0] <= cp <= _TELUGU_UNICODE_RANGE[1]:
-            return True
-    return False
+        if _TELUGU_RANGE[0] <= cp <= _TELUGU_RANGE[1]:
+            telugu += 1
+            total += 1
+            continue
+        matched_other = False
+        for lo, hi in _OTHER_INDIC_RANGES:
+            if lo <= cp <= hi:
+                other_indic += 1
+                total += 1
+                matched_other = True
+                break
+        if matched_other:
+            continue
+        if (0x41 <= cp <= 0x5A) or (0x61 <= cp <= 0x7A):
+            latin += 1
+            total += 1
+            continue
+        # ignore spaces, digits, punctuation
+    return {"telugu": telugu, "other_indic": other_indic, "latin": latin, "total": total}
 
 
 def _sim(a: str, b: str) -> float:
@@ -54,17 +89,12 @@ def _split_artists(s: str):
 
 
 def _artist_overlap_score(req_artists, cand_artists) -> float:
-    """
-    Return best pairwise similarity between requested and candidate artists.
-    0.0 if no plausible overlap.
-    """
     if not req_artists or not cand_artists:
         return 0.0
     best = 0.0
     for r in req_artists:
         for c in cand_artists:
             best = max(best, _sim(r, c))
-            # substring boost — helps "Sid Sriram" vs "Sid Sriram & X"
             if len(r) >= 3 and r in c:
                 best = max(best, 0.95)
             if len(c) >= 3 and c in r:
@@ -72,38 +102,58 @@ def _artist_overlap_score(req_artists, cand_artists) -> float:
     return best
 
 
-def _telugu_bias_score(track_obj) -> float:
+def _candidate_language_signal(name: str, album: str, artists_names) -> dict:
     """
-    Heuristic: how likely this track is a Telugu track.
-    Signals:
-      - album name contains 'telugu' / 'tollywood'
-      - any artist string contains 'telugu'
-      - title/album has Telugu script chars
-    Returns 0.0–1.0
+    Determine language signal from Spotify metadata (title/album/artists).
+    Returns:
+        {
+            "telugu_bias": 0..1,        # positive signal
+            "wrong_lang_bias": 0..1,    # negative signal (other Indic scripts / Hindi/Tamil album hints)
+        }
     """
-    score = 0.0
+    combined_text = " ".join([name or "", album or "", " ".join(artists_names or [])])
+    combined_lower = combined_text.lower()
 
-    name = getattr(track_obj, "name", "") or ""
-    album = ""
-    try:
-        album = (getattr(track_obj, "album", None) and getattr(track_obj.album, "name", "")) or ""
-    except Exception:
-        album = ""
-    artists_names = []
-    try:
-        for a in (getattr(track_obj, "artists", None) or []):
-            artists_names.append(getattr(a, "name", "") or "")
-    except Exception:
-        pass
-    combined = " ".join([name, album, " ".join(artists_names)]).lower()
+    telugu_bias = 0.0
+    wrong = 0.0
 
-    if any(h in combined for h in _TELUGU_HINTS):
-        score = max(score, 0.9)
+    # positive signals
+    if any(h in combined_lower for h in _TELUGU_HINTS):
+        telugu_bias = max(telugu_bias, 0.9)
 
-    if _has_telugu_script(name) or _has_telugu_script(album):
-        score = max(score, 1.0)
+    stats = _script_stats(combined_text)
+    if stats["telugu"] > 0:
+        telugu_bias = 1.0
+    if stats["other_indic"] > 0:
+        wrong = max(wrong, 0.9)
 
-    return score
+    # explicit "hindi"/"tamil"/... in album/title text
+    for bad in ("hindi", "bollywood", "tamil", "kollywood", "kannada", "sandalwood", "punjabi", "malayalam"):
+        if bad in combined_lower:
+            wrong = max(wrong, 0.85)
+
+    return {"telugu_bias": telugu_bias, "wrong_lang_bias": wrong}
+
+
+def _lyrics_language_safety(text: str) -> str:
+    """
+    Post-fetch check on returned lyrics.
+    Returns:
+        "telugu"      -> OK
+        "latin"       -> OK (romanized telugu is common on Spotify)
+        "other_indic" -> NOT OK, reject
+        "unknown"     -> treat as OK by default (don't over-reject)
+    """
+    if not text:
+        return "unknown"
+    stats = _script_stats(text)
+    if stats["telugu"] >= 5:
+        return "telugu"
+    if stats["other_indic"] >= 10 and stats["other_indic"] > stats["telugu"] * 2:
+        return "other_indic"
+    if stats["latin"] >= 20 and stats["other_indic"] == 0:
+        return "latin"
+    return "unknown"
 
 
 def _to_timed(lines):
@@ -134,16 +184,24 @@ def _to_timed(lines):
 
 class SpotifyScraperFetcher(BaseFetcher):
     """
-    Primary synced lyrics source using SpotifyScraper.
+    Primary synced lyrics source using SpotifyScraper — Telugu-first robust matcher.
     Requires env var: SPOTIFY_SP_DC
-    Telugu-biased search + strict artist gate to avoid Hindi/other-language matches.
+
+    Strategy:
+      1) Multiple Spotify search queries (Telugu-biased first).
+      2) Score each candidate on title/artist/telugu-bias/wrong-lang-penalty.
+      3) Try lyrics of the best candidate. If content looks like another Indic
+         script (Hindi/Tamil/Kannada/etc.), reject and try the next candidate.
+      4) If everything fails safety -> return None so Lyrica falls back to
+         LRCLIB / YouTube / LyricsTape.
     """
     source_name = "spotify_scraper"
 
-    # thresholds (tunable via env)
-    _MIN_TITLE_SIM = float(os.getenv("SP_SC_MIN_TITLE_SIM", "0.72"))
-    _MIN_ARTIST_SIM = float(os.getenv("SP_SC_MIN_ARTIST_SIM", "0.72"))
-    _MIN_TELUGU_BIAS = float(os.getenv("SP_SC_MIN_TELUGU_BIAS", "0.6"))
+    # Smart defaults (no env needed)
+    _MIN_TITLE_SIM       = 0.68
+    _MIN_ARTIST_SIM      = 0.65
+    _MIN_TELUGU_BIAS     = 0.50
+    _MIN_COMPOSITE_SCORE = 0.55
 
     async def fetch(self, artist: str, song: str, timestamps: bool = False):
         sp_dc = (os.getenv("SPOTIFY_SP_DC") or "").strip()
@@ -152,106 +210,152 @@ class SpotifyScraperFetcher(BaseFetcher):
 
         loop = asyncio.get_event_loop()
 
-        req_artists = _split_artists(artist)
+        req_artists   = _split_artists(artist)
         req_title_norm = _norm(song)
 
         def _work():
             from spotify_scraper import SpotifyClient
 
-            # Build multiple query variants, from most specific to broadest
             query_variants = [
                 f'track:"{song}" artist:"{artist}" telugu',
                 f'track:"{song}" telugu',
                 f'{song} {artist} telugu',
                 f'{song} telugu',
-                f'{song} {artist}',  # last resort
+                f'track:"{song}" artist:"{artist}"',
             ]
 
-            best = None
-            best_score = -1.0
-            best_reason = ""
-
             with SpotifyClient(cookies={"sp_dc": sp_dc}) as c:
+                # 1) Collect a pool of candidates from multiple queries
+                seen_ids = set()
+                candidates = []  # list of dicts with metadata + score
+
                 for q in query_variants:
                     try:
                         res = c.search(q, types=("track",), limit=5)
                     except Exception:
                         continue
-
                     if not res or not getattr(res, "tracks", None):
                         continue
 
                     for t in res.tracks[:5]:
-                        try:
-                            t_name = getattr(t, "name", "") or ""
-                            t_artists = [getattr(a, "name", "") or "" for a in (getattr(t, "artists", None) or [])]
-                        except Exception:
+                        tid = getattr(t, "id", None)
+                        if not tid or tid in seen_ids:
                             continue
+                        seen_ids.add(tid)
+
+                        t_name = getattr(t, "name", "") or ""
+                        try:
+                            t_album = getattr(t, "album", None) and getattr(t.album, "name", "") or ""
+                        except Exception:
+                            t_album = ""
+                        try:
+                            t_artist_objs = getattr(t, "artists", None) or []
+                            t_artist_names = [getattr(a, "name", "") or "" for a in t_artist_objs]
+                        except Exception:
+                            t_artist_names = []
 
                         title_sim = _sim(req_title_norm, t_name)
-                        artist_sim = _artist_overlap_score(req_artists, [_norm(x) for x in t_artists])
-                        telugu_bias = _telugu_bias_score(t)
+                        artist_sim = _artist_overlap_score(req_artists, [_norm(x) for x in t_artist_names])
+                        lang = _candidate_language_signal(t_name, t_album, t_artist_names)
+                        telugu_bias = lang["telugu_bias"]
+                        wrong_lang = lang["wrong_lang_bias"]
 
-                        # STRICT gates
-                        if title_sim < self._MIN_TITLE_SIM:
-                            continue
-                        if artist_sim < self._MIN_ARTIST_SIM and telugu_bias < self._MIN_TELUGU_BIAS:
-                            # need at least one of (strong artist match) or (strong Telugu signal)
-                            continue
+                        # Composite score. Heavy weight on Telugu, penalize other-lang.
+                        score = (
+                            0.40 * title_sim +
+                            0.25 * artist_sim +
+                            0.35 * telugu_bias -
+                            0.45 * wrong_lang
+                        )
 
-                        # Composite score:
-                        # 0.55 title + 0.30 artist + 0.15 telugu bias
-                        score = (title_sim * 0.55) + (artist_sim * 0.30) + (telugu_bias * 0.15)
+                        candidates.append({
+                            "track": t,
+                            "id": tid,
+                            "name": t_name,
+                            "album": t_album,
+                            "artists": t_artist_names,
+                            "title_sim": title_sim,
+                            "artist_sim": artist_sim,
+                            "telugu_bias": telugu_bias,
+                            "wrong_lang": wrong_lang,
+                            "score": score,
+                            "query": q,
+                        })
 
-                        if score > best_score:
-                            best_score = score
-                            best = t
-                            best_reason = (
-                                f"query='{q}' title_sim={title_sim:.2f} "
-                                f"artist_sim={artist_sim:.2f} telugu={telugu_bias:.2f}"
-                            )
-
-                    # If we found something reasonable on a stronger-biased query, stop early
-                    if best is not None and "telugu" in q.lower():
-                        break
-
-                if best is None:
+                if not candidates:
                     return None
 
-                track_id = getattr(best, "id", None)
-                if not track_id:
-                    return None
+                # 2) Sort candidates: best score first
+                candidates.sort(key=lambda x: x["score"], reverse=True)
 
-                lyr = c.get_lyrics(track_id)
-                if not lyr:
-                    return None
+                # 3) Try lyrics for top N candidates, applying hard gates + safety
+                rejected = []
+                for cand in candidates[:6]:
+                    # Hard gates before we even hit lyrics endpoint
+                    if cand["title_sim"] < SpotifyScraperFetcher._MIN_TITLE_SIM:
+                        rejected.append(("low_title_sim", cand))
+                        continue
+                    if cand["artist_sim"] < SpotifyScraperFetcher._MIN_ARTIST_SIM and cand["telugu_bias"] < SpotifyScraperFetcher._MIN_TELUGU_BIAS:
+                        rejected.append(("weak_artist_and_no_telugu", cand))
+                        continue
+                    if cand["wrong_lang"] >= 0.85 and cand["telugu_bias"] < 0.9:
+                        # explicit non-telugu signal wins → skip
+                        rejected.append(("wrong_lang_metadata", cand))
+                        continue
+                    if cand["score"] < SpotifyScraperFetcher._MIN_COMPOSITE_SCORE:
+                        rejected.append(("low_composite_score", cand))
+                        continue
 
-                lines = getattr(lyr, "lines", None) or []
-                sync_type = str(getattr(lyr, "sync_type", "UNSYNCED") or "UNSYNCED")
+                    # 4) Fetch lyrics
+                    try:
+                        lyr = c.get_lyrics(cand["id"])
+                    except Exception:
+                        rejected.append(("lyrics_exception", cand))
+                        continue
+                    if not lyr:
+                        rejected.append(("no_lyrics", cand))
+                        continue
 
-                timed = _to_timed(lines)
-                plain = "\n".join([x["text"] for x in timed]).strip() if timed else None
-                if not plain:
-                    return None
+                    lines = getattr(lyr, "lines", None) or []
+                    if not lines:
+                        rejected.append(("empty_lines", cand))
+                        continue
 
-                # Prefer the ACTUAL matched track's name/artist so downstream validator
-                # doesn't see mismatched fields.
-                match_name = getattr(best, "name", song) or song
-                match_artists_list = []
-                try:
-                    match_artists_list = [getattr(a, "name", "") or "" for a in (getattr(best, "artists", None) or [])]
-                except Exception:
-                    match_artists_list = [artist]
-                match_artists = ", ".join([a for a in match_artists_list if a]) or artist
+                    sync_type = str(getattr(lyr, "sync_type", "UNSYNCED") or "UNSYNCED")
 
-                return {
-                    "plain": plain,
-                    "timed": timed,
-                    "sync_type": sync_type,
-                    "match_name": match_name,
-                    "match_artists": match_artists,
-                    "reason": best_reason,
-                }
+                    timed = _to_timed(lines)
+                    plain = "\n".join([x["text"] for x in timed]).strip() if timed else None
+                    if not plain:
+                        rejected.append(("empty_plain", cand))
+                        continue
+
+                    # 5) POST-FETCH language safety check
+                    lang_verdict = _lyrics_language_safety(plain)
+                    if lang_verdict == "other_indic":
+                        rejected.append(("wrong_lang_lyrics", cand))
+                        continue
+                    # telugu / latin / unknown → accept
+
+                    return {
+                        "plain": plain,
+                        "timed": timed,
+                        "sync_type": sync_type,
+                        "match_name": cand["name"] or song,
+                        "match_artists": ", ".join([a for a in cand["artists"] if a]) or artist,
+                        "reason": (
+                            f"query='{cand['query']}' "
+                            f"title_sim={cand['title_sim']:.2f} "
+                            f"artist_sim={cand['artist_sim']:.2f} "
+                            f"telugu={cand['telugu_bias']:.2f} "
+                            f"wrong_lang={cand['wrong_lang']:.2f} "
+                            f"score={cand['score']:.2f} "
+                            f"lang_verdict={lang_verdict}"
+                        ),
+                        "rejected_count": len(rejected),
+                    }
+
+                # Everything rejected → return None so fallback sources try
+                return None
 
         try:
             out = await loop.run_in_executor(None, _work)
@@ -272,4 +376,5 @@ class SpotifyScraperFetcher(BaseFetcher):
             has_timestamps=bool(timed_lyrics),
             syncType=out.get("sync_type", "LINE_SYNCED"),
             match_reason=out.get("reason", ""),
+            match_rejected=out.get("rejected_count", 0),
         )
