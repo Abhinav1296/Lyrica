@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import requests
 from typing import Optional, Dict
 from functools import lru_cache
@@ -30,7 +31,13 @@ _SESSION.mount("https://", _adapter)
 _META_THREADS = int(os.getenv("META_THREADS", "4"))
 _EXECUTOR = ThreadPoolExecutor(max_workers=_META_THREADS)
 
+# Best-artwork Redis cache TTL (30 days — album art never changes)
+_ARTWORK_TTL_SECONDS = int(os.getenv("ARTWORK_CACHE_TTL", str(30 * 24 * 3600)))
 
+
+# --------------------------------------------------------------------------- #
+# Legacy per-source fetchers
+# --------------------------------------------------------------------------- #
 def get_musicbrainz_metadata(artist: str, song: str) -> Optional[Dict]:
     try:
         headers = {"User-Agent": UA}
@@ -105,7 +112,6 @@ def get_itunes_metadata(artist: str, song: str) -> Optional[Dict]:
 
 
 def get_lastfm_metadata(artist: str, song: str) -> Optional[Dict]:
-    # Scraping is fragile/slow; keep strict timeout
     try:
         url = f"https://www.last.fm/music/{requests.utils.quote(artist)}/_/{requests.utils.quote(song)}"
         headers = {"User-Agent": UA}
@@ -144,7 +150,6 @@ def get_lastfm_metadata(artist: str, song: str) -> Optional[Dict]:
 
 
 def get_cover_art(release_id: str) -> Optional[str]:
-    # Don’t block long; just check quickly if front exists
     try:
         if not release_id:
             return None
@@ -157,6 +162,149 @@ def get_cover_art(release_id: str) -> Optional[str]:
         return None
 
 
+# --------------------------------------------------------------------------- #
+# NEW: Best-artwork lookup chain (Spotify → iTunes → None)
+# Result is memoized in-process AND persisted to Redis for 30 days.
+# --------------------------------------------------------------------------- #
+def _spotify_artwork(artist: str, song: str) -> Optional[str]:
+    """
+    Fetch highest-quality album art from Spotify via SpotifyScraper.
+    Uses the same SPOTIFY_SP_DC cookie as the lyrics fetcher.
+    Returns image URL (usually 640x640) or None.
+    """
+    sp_dc = (os.getenv("SPOTIFY_SP_DC") or "").strip()
+    if not sp_dc:
+        return None
+
+    try:
+        from spotify_scraper import SpotifyClient
+    except ImportError:
+        logger.debug("spotify_scraper not installed — cannot fetch Spotify artwork")
+        return None
+
+    # Telugu-biased queries, most specific first
+    query_variants = [
+        f'track:"{song}" artist:"{artist}" telugu',
+        f'track:"{song}" artist:"{artist}"',
+        f'{song} {artist} telugu',
+        f'{song} telugu',
+    ]
+
+    try:
+        with SpotifyClient(cookies={"sp_dc": sp_dc}) as c:
+            for q in query_variants:
+                try:
+                    res = c.search(q, types=("track",), limit=3)
+                except Exception:
+                    continue
+                if not res or not getattr(res, "tracks", None):
+                    continue
+
+                for t in res.tracks[:3]:
+                    try:
+                        album = getattr(t, "album", None)
+                        if not album:
+                            continue
+                        images = getattr(album, "images", None) or []
+                        if not images:
+                            continue
+                        # Spotify images are sorted largest-first
+                        img = images[0]
+                        url = getattr(img, "url", None) or (img.get("url") if isinstance(img, dict) else None)
+                        if url:
+                            logger.info(f"[artwork] spotify hit for '{artist} - {song}': {url}")
+                            return url
+                    except Exception:
+                        continue
+        return None
+    except Exception as e:
+        logger.debug(f"[artwork] spotify error: {e}")
+        return None
+
+
+def _itunes_artwork(artist: str, song: str) -> Optional[str]:
+    """
+    Fetch high-quality album art from iTunes Search API.
+    Returns image URL (upgraded to 1200x1200) or None.
+    """
+    try:
+        data = get_itunes_metadata(artist, song)
+        if data and data.get("album_art"):
+            logger.info(f"[artwork] itunes hit for '{artist} - {song}'")
+            return data["album_art"]
+        return None
+    except Exception as e:
+        logger.debug(f"[artwork] itunes error: {e}")
+        return None
+
+
+def _artwork_cache_key(artist: str, song: str) -> str:
+    """Stable cache key for artwork lookups."""
+    import hashlib
+    payload = f"artwork:v1:{(artist or '').strip().lower()}|{(song or '').strip().lower()}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def get_best_artwork(artist: str, song: str) -> Optional[str]:
+    """
+    Best-effort album art lookup with graceful fallback:
+      1. Spotify (highest quality, ~640×640)
+      2. iTunes  (good quality, upgraded to 1200×1200)
+      3. None    (caller falls back to whatever JioSaavn provided)
+
+    Result cached in Redis for 30 days via the shared cache layer.
+    Never raises — always returns a URL string or None.
+    """
+    if not artist or not song:
+        return None
+
+    # Lazy import to avoid circular deps at module load
+    try:
+        from src.cache import load_from_cache, save_to_cache
+    except Exception:
+        load_from_cache = None
+        save_to_cache = None
+
+    cache_key = _artwork_cache_key(artist, song)
+
+    # L1/L2/L3 cache lookup
+    if load_from_cache:
+        cached = load_from_cache(cache_key)
+        if cached is not None:
+            # Cache may store "" to mean "we tried, both failed"
+            return cached or None
+
+    url: Optional[str] = None
+
+    # 1) Spotify
+    try:
+        url = _spotify_artwork(artist, song)
+    except Exception as e:
+        logger.debug(f"[artwork] spotify layer crashed: {e}")
+
+    # 2) iTunes fallback
+    if not url:
+        try:
+            url = _itunes_artwork(artist, song)
+        except Exception as e:
+            logger.debug(f"[artwork] itunes layer crashed: {e}")
+
+    # Persist result (store "" for negative hits so we don't retry for 30 days)
+    if save_to_cache:
+        try:
+            save_to_cache(cache_key, url or "")
+        except Exception:
+            pass
+
+    if not url:
+        logger.info(f"[artwork] no external art found for '{artist} - {song}'")
+
+    return url or None
+
+
+# --------------------------------------------------------------------------- #
+# Aggregate metadata (existing behavior + best-artwork override)
+# --------------------------------------------------------------------------- #
 @lru_cache(maxsize=500)
 def get_song_metadata(artist: str, song: str) -> Dict:
     """
@@ -169,9 +317,10 @@ def get_song_metadata(artist: str, song: str) -> Dict:
             "itunes":      lambda: get_itunes_metadata(artist, song),
             "lastfm":      lambda: get_lastfm_metadata(artist, song),
             "wikipedia":   lambda: get_wikipedia_summary(artist, song),
+            "best_art":    lambda: get_best_artwork(artist, song),
         }
 
-        results: Dict[str, Optional[Dict]] = {k: None for k in tasks}
+        results: Dict[str, Optional[object]] = {k: None for k in tasks}
 
         futures = { _EXECUTOR.submit(fn): name for name, fn in tasks.items() }
 
@@ -190,6 +339,7 @@ def get_song_metadata(artist: str, song: str) -> Dict:
         itunes_data = results.get("itunes")
         lastfm_data = results.get("lastfm")
         wiki_data = results.get("wikipedia")
+        best_art = results.get("best_art")  # str URL or None
 
         metadata = {}
         sources_used = []
@@ -259,6 +409,13 @@ def get_song_metadata(artist: str, song: str) -> Dict:
                 "wiki_thumbnail": wiki_data.get("thumbnail", ""),
                 "wiki_url": wiki_data.get("url", ""),
             })
+
+        # BEST ARTWORK OVERRIDE — Spotify/iTunes wins over MusicBrainz Cover Art
+        # (which is often empty for Telugu movies).
+        if isinstance(best_art, str) and best_art:
+            metadata["album_art"] = best_art
+            if best_art not in ("", None):
+                sources_used.append("BestArtwork")
 
         if not metadata:
             return {"success": False, "error": f"No metadata found for '{song}' by '{artist}'", "sources": []}
