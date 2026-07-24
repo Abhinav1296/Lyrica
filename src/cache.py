@@ -31,6 +31,7 @@ _REDIS_ENABLED = (os.getenv("REDIS_ENABLED", "true").lower() == "true")
 _REDIS_URL = os.getenv("REDIS_URL", "").strip()
 _REDIS_PREFIX = os.getenv("REDIS_PREFIX", "lyrica:cache:")
 
+
 def _redis_client():
     """
     Lazy init a global redis client (connection pool).
@@ -48,7 +49,6 @@ def _redis_client():
             return _REDIS
         try:
             import redis
-            # Upstash uses rediss:// (TLS). decode_responses=True returns strings.
             _REDIS = redis.Redis.from_url(
                 _REDIS_URL,
                 decode_responses=True,
@@ -132,7 +132,6 @@ def _redis_set(key: str, result, ttl: int = CACHE_TTL):
         return
     try:
         raw = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
-        # setex = set with expiry
         r.setex(_redis_key(key), int(ttl), raw)
     except Exception:
         pass
@@ -190,7 +189,6 @@ def load_from_cache(key: str):
     disk = _disk_get(key)
     if disk is not None:
         _mem_set(key, disk)
-        # also backfill redis so next time survives restart
         _redis_set(key, disk)
         return disk
 
@@ -198,13 +196,8 @@ def load_from_cache(key: str):
 
 
 def save_to_cache(key: str, result):
-    # Memory first
     _mem_set(key, result)
-
-    # Redis second (persistent)
     _redis_set(key, result)
-
-    # Disk last (best-effort)
     _disk_set(key, result)
 
 
@@ -215,16 +208,11 @@ def get_or_fetch_coalesced(
 ) -> Tuple[Any, bool]:
     """
     Returns: (result, cache_hit)
-
-    - HIT: returned from memory/redis/disk immediately
-    - MISS: leader computes fetch_func
-    - COALESCED: followers wait for leader; then read cache
     """
     cached = load_from_cache(key)
     if cached is not None:
         return cached, True
 
-    # In-flight coalescing (per instance)
     with _INFLIGHT_LOCK:
         ev = _INFLIGHT.get(key)
         if ev is None:
@@ -239,7 +227,6 @@ def get_or_fetch_coalesced(
         cached2 = load_from_cache(key)
         if cached2 is not None:
             return cached2, True
-        # leader failed / didn't cache -> last resort compute
         return fetch_func(), False
 
     try:
@@ -254,30 +241,79 @@ def get_or_fetch_coalesced(
             _INFLIGHT.pop(key, None)
 
 
-def clear_cache():
-    removed, failed = [], []
+def _clear_redis_scoped() -> dict:
+    """
+    Delete only keys under our prefix. Safe on shared Redis.
+    Returns: {"redis_ok": bool, "redis_deleted": int, "redis_error": str|None}
+    """
+    r = _redis_client()
+    if not r:
+        return {"redis_ok": False, "redis_deleted": 0, "redis_error": "redis_unavailable"}
 
-    # memory
+    prefix = _REDIS_PREFIX if _REDIS_PREFIX.endswith(":") or _REDIS_PREFIX == "" else _REDIS_PREFIX
+    pattern = f"{prefix}*"
+
+    deleted = 0
+    try:
+        # Use SCAN in batches, then DEL — safe for large keyspaces.
+        cursor = 0
+        batch = []
+        while True:
+            cursor, keys = r.scan(cursor=cursor, match=pattern, count=200)
+            if keys:
+                batch.extend(keys)
+                # flush in chunks to avoid huge single DEL
+                if len(batch) >= 500:
+                    deleted += r.delete(*batch)
+                    batch = []
+            if cursor == 0:
+                break
+        if batch:
+            deleted += r.delete(*batch)
+
+        return {"redis_ok": True, "redis_deleted": int(deleted), "redis_error": None}
+    except Exception as e:
+        return {"redis_ok": False, "redis_deleted": int(deleted), "redis_error": str(e)}
+
+
+def clear_cache():
+    """
+    Clears:
+      - in-memory L1
+      - Redis L2 (scoped by _REDIS_PREFIX; other Redis keys are untouched)
+      - disk L3
+    """
+    removed_disk, failed_disk = [], []
+
+    # 1) memory
     with _MEM_LOCK:
+        mem_count = len(_MEM)
         _MEM.clear()
 
-    # redis (only keys with prefix — safest approach is: do nothing unless you really need it)
-    # We won't scan/delete by prefix here to avoid heavy operations on free tier.
-    # If you need full Redis clear, do it from Upstash dashboard.
+    # 2) Redis (scoped by prefix)
+    redis_info = _clear_redis_scoped()
 
-    # disk
+    # 3) disk (best-effort)
     try:
         for fname in os.listdir(CACHE_DIR):
             path = os.path.join(CACHE_DIR, fname)
             try:
                 os.remove(path)
-                removed.append(fname)
+                removed_disk.append(fname)
             except Exception as e:
-                failed.append({"file": fname, "error": str(e)})
+                failed_disk.append({"file": fname, "error": str(e)})
     except Exception:
         pass
 
-    return {"removed": removed, "failed": failed, "memory_cleared": True, "redis_cleared": False}
+    return {
+        "memory_cleared": True,
+        "memory_entries_cleared": mem_count,
+        "redis_cleared": bool(redis_info.get("redis_ok")),
+        "redis_deleted": int(redis_info.get("redis_deleted", 0)),
+        "redis_error": redis_info.get("redis_error"),
+        "removed": removed_disk,
+        "failed": failed_disk,
+    }
 
 
 def cache_stats():
