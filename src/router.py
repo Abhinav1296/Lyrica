@@ -5,6 +5,7 @@ import asyncio
 import httpx as _httpx
 import time
 import uuid
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
 from src.logger import get_logger
@@ -34,6 +35,10 @@ _META_BG_EXEC = ThreadPoolExecutor(max_workers=2)
 # Metadata time budget (seconds). Keep low so /lyrics doesn't stall.
 META_BUDGET_SECONDS = float(os.getenv("META_BUDGET_SECONDS", "4.0"))
 
+# Cache TTLs (seconds) for auxiliary endpoints
+JIOSAAVN_SEARCH_TTL = int(os.getenv("JIOSAAVN_SEARCH_TTL", str(6 * 3600)))   # 6h
+TRENDING_TTL        = int(os.getenv("TRENDING_TTL",        str(24 * 3600)))  # 24h
+
 
 def run_async(coro, timeout=30):
     """Run async coroutine safely in sync context with timeout"""
@@ -49,6 +54,15 @@ def run_async(coro, timeout=30):
         raise Exception("Request timed out - operation took too long")
     except RuntimeError:
         return asyncio.run(asyncio.wait_for(coro, timeout=timeout))
+
+
+def _aux_cache_key(namespace: str, payload: str) -> str:
+    """
+    Build a cache key for auxiliary (non-lyrics) endpoints so they share the
+    same Redis prefix / L1 / L3 layers but never collide with lyrics keys.
+    """
+    raw = f"{namespace}|{payload}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def register_routes(app):
@@ -313,78 +327,151 @@ def register_routes(app):
 
     @app.route("/trending/", methods=["GET"])
     def trending():
+        """
+        Trending endpoint — now cached in Redis (via get_or_fetch_coalesced).
+        TTL: TRENDING_TTL (default 24h).
+        Falls back to the TrendingAnalyticsEngine in-memory cache for free.
+        """
         country = request.args.get("country", "US").strip().upper()
         countries_param = request.args.get("countries", "").strip()
         limit = request.args.get("limit", 20, type=int)
         if limit < 1 or limit > 100:
             limit = 20
 
-        try:
-            if country and not countries_param:
+        rid = str(uuid.uuid4())[:8]
+        t0 = time.perf_counter()
+
+        def _compute_single(country_code: str) -> dict:
+            try:
+                country_enum = Country[country_code]
+            except KeyError:
+                return {
+                    "status": "error",
+                    "error": {"message": f"Invalid country code: {country_code}",
+                              "timestamp": datetime.now(timezone.utc).isoformat()},
+                }
+            trending_songs = trending_engine.fetch_trending_songs(country_enum, limit)
+            return {
+                "status": "success",
+                "data": {
+                    "country": country_code,
+                    "trending": [song.to_dict() for song in trending_songs],
+                    "total": len(trending_songs),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            }
+
+        def _compute_multi(country_list: list) -> dict:
+            data = {}
+            for c in country_list:
                 try:
-                    country_enum = Country[country]
+                    country_enum = Country[c]
+                    songs = trending_engine.fetch_trending_songs(country_enum, limit)
+                    data[c] = [s.to_dict() for s in songs]
                 except KeyError:
-                    return jsonify({
-                        "status": "error",
-                        "error": {"message": f"Invalid country code: {country}", "timestamp": datetime.now(timezone.utc).isoformat()},
-                    }), 400
+                    continue
+            return {
+                "status": "success",
+                "data": {"countries": data, "timestamp": datetime.now(timezone.utc).isoformat()},
+            }
 
-                trending_songs = trending_engine.fetch_trending_songs(country_enum, limit)
-                return jsonify({
-                    "status": "success",
-                    "data": {
-                        "country": country,
-                        "trending": [song.to_dict() for song in trending_songs],
-                        "total": len(trending_songs),
-                        "timestamp": datetime.now(timezone.utc).isoformat()
-                    }
-                }), 200
-
+        try:
             if countries_param:
-                country_list = [c.strip().upper() for c in countries_param.split(",")]
-                trending_data = {}
-                for c in country_list:
-                    try:
-                        country_enum = Country[c]
-                        trending_songs = trending_engine.fetch_trending_songs(country_enum, limit)
-                        trending_data[c] = [song.to_dict() for song in trending_songs]
-                    except KeyError:
-                        continue
+                country_list = [c.strip().upper() for c in countries_param.split(",") if c.strip()]
+                key_payload = f"multi:{','.join(sorted(country_list))}:limit={limit}"
+                cache_key = _aux_cache_key("trending", key_payload)
+                result, hit = get_or_fetch_coalesced(
+                    cache_key,
+                    lambda: _compute_multi(country_list),
+                    should_cache=lambda r: isinstance(r, dict) and r.get("status") == "success",
+                )
+                elapsed = time.perf_counter() - t0
+                logger.info(f"[perf] rid={rid} /trending multi hit={hit} in {elapsed:.3f}s")
+                return jsonify(result), 200
 
-                return jsonify({
-                    "status": "success",
-                    "data": {"countries": trending_data, "timestamp": datetime.now(timezone.utc).isoformat()}
-                }), 200
+            if country:
+                key_payload = f"single:{country}:limit={limit}"
+                cache_key = _aux_cache_key("trending", key_payload)
+                result, hit = get_or_fetch_coalesced(
+                    cache_key,
+                    lambda: _compute_single(country),
+                    should_cache=lambda r: isinstance(r, dict) and r.get("status") == "success",
+                )
+                elapsed = time.perf_counter() - t0
+                logger.info(f"[perf] rid={rid} /trending {country} hit={hit} in {elapsed:.3f}s")
+                if result.get("status") == "error":
+                    return jsonify(result), 400
+                return jsonify(result), 200
 
             return jsonify({
                 "status": "success",
-                "data": {"countries": {}, "timestamp": datetime.now(timezone.utc).isoformat()}
+                "data": {"countries": {}, "timestamp": datetime.now(timezone.utc).isoformat()},
             }), 200
 
         except Exception as e:
             return jsonify({
                 "status": "error",
-                "error": {"message": "Failed to fetch trending data", "details": str(e), "timestamp": datetime.now(timezone.utc).isoformat()}
+                "error": {"message": "Failed to fetch trending data", "details": str(e),
+                          "timestamp": datetime.now(timezone.utc).isoformat()},
             }), 500
 
     @app.route("/api/jiosaavn/search", methods=["GET"])
     def jiosaavn_search():
+        """
+        JioSaavn search endpoint — now cached in Redis (via get_or_fetch_coalesced).
+        TTL: JIOSAAVN_SEARCH_TTL (default 6h).
+        Kills the Home refetch storm from downstream apps like Swara.
+        """
         query = request.args.get("q", "").strip()
         if not query:
             return jsonify({
                 "status": "error",
-                "error": {"message": "Query parameter 'q' is required", "timestamp": datetime.now(timezone.utc).isoformat()},
+                "error": {"message": "Query parameter 'q' is required",
+                          "timestamp": datetime.now(timezone.utc).isoformat()},
             }), 400
 
+        rid = str(uuid.uuid4())[:8]
+        t0 = time.perf_counter()
+
+        # Normalize query for cache key stability
+        key_payload = query.lower().strip()
+        cache_key = _aux_cache_key("jiosaavn_search", key_payload)
+
+        def _compute():
+            try:
+                results = search_jiosaavn(query)
+                if asyncio.iscoroutine(results):
+                    results = run_async(results, timeout=30)
+                return {"status": "success", "results": results}
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "error": {"message": "Failed to search JioSaavn", "details": str(e),
+                              "timestamp": datetime.now(timezone.utc).isoformat()},
+                }
+
+        def _should_cache(res: dict) -> bool:
+            # Cache only successful, non-empty responses
+            return (
+                isinstance(res, dict)
+                and res.get("status") == "success"
+                and isinstance(res.get("results"), list)
+                and len(res["results"]) > 0
+            )
+
         try:
-            results = search_jiosaavn(query)
-            if asyncio.iscoroutine(results):
-                results = run_async(results, timeout=30)
-            return jsonify({"status": "success", "results": results}), 200
+            result, hit = get_or_fetch_coalesced(cache_key, _compute, should_cache=_should_cache)
+            elapsed = time.perf_counter() - t0
+            logger.info(f"[perf] rid={rid} /api/jiosaavn/search q='{query[:40]}' hit={hit} in {elapsed:.3f}s")
+
+            if isinstance(result, dict) and result.get("status") == "error":
+                return jsonify(result), 500
+            return jsonify(result), 200
         except Exception as e:
             return jsonify({
                 "status": "error",
-                "error": {"message": "Failed to search JioSaavn", "details": str(e), "timestamp": datetime.now(timezone.utc).isoformat()},
+                "error": {"message": "Failed to search JioSaavn", "details": str(e),
+                          "timestamp": datetime.now(timezone.utc).isoformat()},
             }), 500
 
     @app.route("/api/jiosaavn/play", methods=["GET"])
@@ -393,7 +480,8 @@ def register_routes(app):
         if not song_link:
             return jsonify({
                 "status": "error",
-                "error": {"message": "songLink parameter is required", "timestamp": datetime.now(timezone.utc).isoformat()},
+                "error": {"message": "songLink parameter is required",
+                          "timestamp": datetime.now(timezone.utc).isoformat()},
             }), 400
 
         try:
@@ -404,7 +492,8 @@ def register_routes(app):
         except Exception as e:
             return jsonify({
                 "status": "error",
-                "error": {"message": "Failed to fetch stream", "details": str(e), "timestamp": datetime.now(timezone.utc).isoformat()},
+                "error": {"message": "Failed to fetch stream", "details": str(e),
+                          "timestamp": datetime.now(timezone.utc).isoformat()},
             }), 500
 
     @app.route("/suggestion", methods=["GET"])
@@ -414,7 +503,8 @@ def register_routes(app):
         if not query:
             return jsonify({
                 "status": "error",
-                "error": {"message": "Query parameter 'q' is required", "timestamp": datetime.now(timezone.utc).isoformat()},
+                "error": {"message": "Query parameter 'q' is required",
+                          "timestamp": datetime.now(timezone.utc).isoformat()},
             }), 400
         if limit < 1 or limit > 100:
             limit = 10
@@ -431,7 +521,8 @@ def register_routes(app):
         except Exception:
             return jsonify({
                 "status": "error",
-                "error": {"message": "Failed to fetch suggestions from MusicBrainz", "timestamp": datetime.now(timezone.utc).isoformat()},
+                "error": {"message": "Failed to fetch suggestions from MusicBrainz",
+                          "timestamp": datetime.now(timezone.utc).isoformat()},
             }), 500
 
         recordings = data.get("recordings", [])
@@ -449,7 +540,8 @@ def register_routes(app):
             artist_name = "".join(artist_parts).strip() or "Unknown Artist"
             results.append({"title": title, "artist": artist_name})
 
-        return jsonify({"status": "success", "query": query, "limit": limit, "total": len(results), "results": results}), 200
+        return jsonify({"status": "success", "query": query, "limit": limit,
+                        "total": len(results), "results": results}), 200
 
     @app.route("/app", methods=["GET"])
     def app_page():
@@ -458,7 +550,8 @@ def register_routes(app):
         except Exception as e:
             return jsonify({
                 "status": "error",
-                "error": {"message": "Failed to load application", "details": str(e), "timestamp": datetime.now(timezone.utc).isoformat()},
+                "error": {"message": "Failed to load application", "details": str(e),
+                          "timestamp": datetime.now(timezone.utc).isoformat()},
             }), 500
 
     @app.route("/cache/stats", methods=["GET"])
@@ -469,7 +562,8 @@ def register_routes(app):
         except Exception as e:
             return jsonify({
                 "status": "error",
-                "error": {"message": "Failed to retrieve cache stats", "details": str(e), "timestamp": datetime.now(timezone.utc).isoformat()},
+                "error": {"message": "Failed to retrieve cache stats", "details": str(e),
+                          "timestamp": datetime.now(timezone.utc).isoformat()},
             }), 500
 
     @app.route("/cache/clear", methods=["POST"])
@@ -483,7 +577,8 @@ def register_routes(app):
         except Exception as e:
             return jsonify({
                 "status": "error",
-                "error": {"message": "Failed to clear cache", "details": str(e), "timestamp": datetime.now(timezone.utc).isoformat()},
+                "error": {"message": "Failed to clear cache", "details": str(e),
+                          "timestamp": datetime.now(timezone.utc).isoformat()},
             }), 500
 
     @app.route("/favicon.ico", methods=["GET"])
@@ -494,7 +589,8 @@ def register_routes(app):
     def not_found(error):
         return jsonify({
             "status": "error",
-            "error": {"message": "Endpoint not found", "timestamp": datetime.now(timezone.utc).isoformat()},
+            "error": {"message": "Endpoint not found",
+                      "timestamp": datetime.now(timezone.utc).isoformat()},
         }), 404
 
     @app.errorhandler(500)
@@ -502,5 +598,6 @@ def register_routes(app):
         logger.error(f"Internal server error: {str(error)}")
         return jsonify({
             "status": "error",
-            "error": {"message": "Internal server error", "timestamp": datetime.now(timezone.utc).isoformat()},
+            "error": {"message": "Internal server error",
+                      "timestamp": datetime.now(timezone.utc).isoformat()},
         }), 500
