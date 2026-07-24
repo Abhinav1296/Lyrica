@@ -10,9 +10,7 @@ from .base_fetcher import BaseFetcher, build_result
 # ------------------------------------------------------------------
 # Script ranges
 # ------------------------------------------------------------------
-# Telugu script
 _TELUGU_RANGE = (0x0C00, 0x0C7F)
-# Other Indic scripts we treat as "wrong language" signal for Telugu-first app
 _OTHER_INDIC_RANGES = [
     (0x0900, 0x097F),  # Devanagari (Hindi/Marathi/Sanskrit)
     (0x0A00, 0x0A7F),  # Gurmukhi (Punjabi)
@@ -22,6 +20,15 @@ _OTHER_INDIC_RANGES = [
     (0x0980, 0x09FF),  # Bengali
 ]
 _TELUGU_HINTS = ("telugu", "tollywood")
+_OTHER_LANG_HINTS = (
+    "hindi", "bollywood",
+    "tamil", "kollywood",
+    "kannada", "sandalwood",
+    "punjabi",
+    "malayalam", "mollywood",
+    "bengali",
+    "marathi",
+)
 
 
 def _norm(s: str) -> str:
@@ -34,9 +41,6 @@ def _norm(s: str) -> str:
 
 
 def _script_stats(text: str) -> dict:
-    """
-    Count characters per relevant script.
-    """
     telugu = 0
     other_indic = 0
     latin = 0
@@ -62,8 +66,6 @@ def _script_stats(text: str) -> dict:
         if (0x41 <= cp <= 0x5A) or (0x61 <= cp <= 0x7A):
             latin += 1
             total += 1
-            continue
-        # ignore spaces, digits, punctuation
     return {"telugu": telugu, "other_indic": other_indic, "latin": latin, "total": total}
 
 
@@ -104,11 +106,11 @@ def _artist_overlap_score(req_artists, cand_artists) -> float:
 
 def _candidate_language_signal(name: str, album: str, artists_names) -> dict:
     """
-    Determine language signal from Spotify metadata (title/album/artists).
+    Detect Telugu / wrong-language signals from Spotify metadata.
     Returns:
         {
-            "telugu_bias": 0..1,        # positive signal
-            "wrong_lang_bias": 0..1,    # negative signal (other Indic scripts / Hindi/Tamil album hints)
+            "telugu_bias": 0..1,       # positive Telugu evidence
+            "wrong_lang_bias": 0..1,   # explicit non-Telugu evidence
         }
     """
     combined_text = " ".join([name or "", album or "", " ".join(artists_names or [])])
@@ -117,7 +119,6 @@ def _candidate_language_signal(name: str, album: str, artists_names) -> dict:
     telugu_bias = 0.0
     wrong = 0.0
 
-    # positive signals
     if any(h in combined_lower for h in _TELUGU_HINTS):
         telugu_bias = max(telugu_bias, 0.9)
 
@@ -127,8 +128,7 @@ def _candidate_language_signal(name: str, album: str, artists_names) -> dict:
     if stats["other_indic"] > 0:
         wrong = max(wrong, 0.9)
 
-    # explicit "hindi"/"tamil"/... in album/title text
-    for bad in ("hindi", "bollywood", "tamil", "kollywood", "kannada", "sandalwood", "punjabi", "malayalam"):
+    for bad in _OTHER_LANG_HINTS:
         if bad in combined_lower:
             wrong = max(wrong, 0.85)
 
@@ -137,12 +137,11 @@ def _candidate_language_signal(name: str, album: str, artists_names) -> dict:
 
 def _lyrics_language_safety(text: str) -> str:
     """
-    Post-fetch check on returned lyrics.
     Returns:
-        "telugu"      -> OK
-        "latin"       -> OK (romanized telugu is common on Spotify)
-        "other_indic" -> NOT OK, reject
-        "unknown"     -> treat as OK by default (don't over-reject)
+      'telugu'      -> OK (native Telugu script)
+      'latin'       -> POTENTIALLY OK (may be romanized Telugu, but also Hindi/Tamil)
+      'other_indic' -> REJECT (Devanagari/Tamil/etc.)
+      'unknown'     -> treat as risky
     """
     if not text:
         return "unknown"
@@ -184,24 +183,30 @@ def _to_timed(lines):
 
 class SpotifyScraperFetcher(BaseFetcher):
     """
-    Primary synced lyrics source using SpotifyScraper — Telugu-first robust matcher.
+    Primary synced lyrics source using SpotifyScraper — Telugu-first strict matcher.
     Requires env var: SPOTIFY_SP_DC
 
     Strategy:
-      1) Multiple Spotify search queries (Telugu-biased first).
+      1) Try multiple Spotify queries, Telugu-biased first.
       2) Score each candidate on title/artist/telugu-bias/wrong-lang-penalty.
-      3) Try lyrics of the best candidate. If content looks like another Indic
-         script (Hindi/Tamil/Kannada/etc.), reject and try the next candidate.
-      4) If everything fails safety -> return None so Lyrica falls back to
-         LRCLIB / YouTube / LyricsTape.
+      3) Hard-gate candidates:
+         - title similarity
+         - some Telugu evidence OR strong artist overlap
+         - no other-language hint (hindi/tamil/kannada/etc.)
+      4) Fetch lyrics for the best candidates. Verify actual script:
+         - Telugu script -> accept
+         - Other Indic script -> reject
+         - Latin script -> accept ONLY IF the candidate had positive Telugu evidence
+           and no other-language hint. Otherwise reject to avoid romanized Hindi/Tamil.
+      5) If nothing passes -> return None (let Lyrica fallback chain try LRCLIB/YouTube/LyricsTape).
     """
     source_name = "spotify_scraper"
 
     # Smart defaults (no env needed)
-    _MIN_TITLE_SIM       = 0.68
-    _MIN_ARTIST_SIM      = 0.65
-    _MIN_TELUGU_BIAS     = 0.50
-    _MIN_COMPOSITE_SCORE = 0.55
+    _MIN_TITLE_SIM        = 0.68
+    _MIN_ARTIST_SIM       = 0.65
+    _MIN_TELUGU_BIAS      = 0.50
+    _MIN_COMPOSITE_SCORE  = 0.55
 
     async def fetch(self, artist: str, song: str, timestamps: bool = False):
         sp_dc = (os.getenv("SPOTIFY_SP_DC") or "").strip()
@@ -210,7 +215,7 @@ class SpotifyScraperFetcher(BaseFetcher):
 
         loop = asyncio.get_event_loop()
 
-        req_artists   = _split_artists(artist)
+        req_artists    = _split_artists(artist)
         req_title_norm = _norm(song)
 
         def _work():
@@ -225,9 +230,9 @@ class SpotifyScraperFetcher(BaseFetcher):
             ]
 
             with SpotifyClient(cookies={"sp_dc": sp_dc}) as c:
-                # 1) Collect a pool of candidates from multiple queries
+                # 1) Collect candidates
                 seen_ids = set()
-                candidates = []  # list of dicts with metadata + score
+                candidates = []
 
                 for q in query_variants:
                     try:
@@ -254,18 +259,18 @@ class SpotifyScraperFetcher(BaseFetcher):
                         except Exception:
                             t_artist_names = []
 
-                        title_sim = _sim(req_title_norm, t_name)
+                        title_sim  = _sim(req_title_norm, t_name)
                         artist_sim = _artist_overlap_score(req_artists, [_norm(x) for x in t_artist_names])
-                        lang = _candidate_language_signal(t_name, t_album, t_artist_names)
+                        lang       = _candidate_language_signal(t_name, t_album, t_artist_names)
                         telugu_bias = lang["telugu_bias"]
-                        wrong_lang = lang["wrong_lang_bias"]
+                        wrong_lang  = lang["wrong_lang_bias"]
 
-                        # Composite score. Heavy weight on Telugu, penalize other-lang.
+                        # Composite score — heavy weight on Telugu, big penalty for other-lang
                         score = (
-                            0.40 * title_sim +
-                            0.25 * artist_sim +
-                            0.35 * telugu_bias -
-                            0.45 * wrong_lang
+                            0.35 * title_sim +
+                            0.20 * artist_sim +
+                            0.45 * telugu_bias -
+                            0.55 * wrong_lang
                         )
 
                         candidates.append({
@@ -274,34 +279,38 @@ class SpotifyScraperFetcher(BaseFetcher):
                             "name": t_name,
                             "album": t_album,
                             "artists": t_artist_names,
-                            "title_sim": title_sim,
-                            "artist_sim": artist_sim,
+                            "title_sim":   title_sim,
+                            "artist_sim":  artist_sim,
                             "telugu_bias": telugu_bias,
-                            "wrong_lang": wrong_lang,
-                            "score": score,
-                            "query": q,
+                            "wrong_lang":  wrong_lang,
+                            "score":       score,
+                            "query":       q,
                         })
 
                 if not candidates:
                     return None
 
-                # 2) Sort candidates: best score first
+                # 2) Sort candidates best first
                 candidates.sort(key=lambda x: x["score"], reverse=True)
 
-                # 3) Try lyrics for top N candidates, applying hard gates + safety
+                # 3) Evaluate top N with strict gates
                 rejected = []
                 for cand in candidates[:6]:
-                    # Hard gates before we even hit lyrics endpoint
                     if cand["title_sim"] < SpotifyScraperFetcher._MIN_TITLE_SIM:
                         rejected.append(("low_title_sim", cand))
                         continue
-                    if cand["artist_sim"] < SpotifyScraperFetcher._MIN_ARTIST_SIM and cand["telugu_bias"] < SpotifyScraperFetcher._MIN_TELUGU_BIAS:
-                        rejected.append(("weak_artist_and_no_telugu", cand))
-                        continue
+
+                    # If candidate has explicit non-telugu hint, reject unless telugu evidence is overwhelming
                     if cand["wrong_lang"] >= 0.85 and cand["telugu_bias"] < 0.9:
-                        # explicit non-telugu signal wins → skip
                         rejected.append(("wrong_lang_metadata", cand))
                         continue
+
+                    # Need either strong artist match OR clear Telugu evidence
+                    if cand["artist_sim"] < SpotifyScraperFetcher._MIN_ARTIST_SIM \
+                       and cand["telugu_bias"] < SpotifyScraperFetcher._MIN_TELUGU_BIAS:
+                        rejected.append(("weak_artist_and_no_telugu", cand))
+                        continue
+
                     if cand["score"] < SpotifyScraperFetcher._MIN_COMPOSITE_SCORE:
                         rejected.append(("low_composite_score", cand))
                         continue
@@ -329,19 +338,41 @@ class SpotifyScraperFetcher(BaseFetcher):
                         rejected.append(("empty_plain", cand))
                         continue
 
-                    # 5) POST-FETCH language safety check
+                    # 5) POST-FETCH language safety
                     lang_verdict = _lyrics_language_safety(plain)
+
                     if lang_verdict == "other_indic":
                         rejected.append(("wrong_lang_lyrics", cand))
                         continue
-                    # telugu / latin / unknown → accept
+
+                    if lang_verdict == "latin":
+                        # Romanized text is ambiguous between Telugu / Hindi / Tamil.
+                        # Only accept if candidate metadata clearly points to Telugu.
+                        if cand["telugu_bias"] < 0.5 or cand["wrong_lang"] >= 0.85:
+                            rejected.append(("latin_without_telugu_evidence", cand))
+                            continue
+
+                    if lang_verdict == "unknown":
+                        # Be conservative: only accept unknown if we have Telugu evidence too.
+                        if cand["telugu_bias"] < 0.5:
+                            rejected.append(("unknown_script_without_telugu_evidence", cand))
+                            continue
+
+                    # ACCEPT
+                    match_name = getattr(cand["track"], "name", song) or song
+                    match_artists_list = []
+                    try:
+                        match_artists_list = [getattr(a, "name", "") or "" for a in (getattr(cand["track"], "artists", None) or [])]
+                    except Exception:
+                        match_artists_list = [artist]
+                    match_artists = ", ".join([a for a in match_artists_list if a]) or artist
 
                     return {
                         "plain": plain,
                         "timed": timed,
                         "sync_type": sync_type,
-                        "match_name": cand["name"] or song,
-                        "match_artists": ", ".join([a for a in cand["artists"] if a]) or artist,
+                        "match_name": match_name,
+                        "match_artists": match_artists,
                         "reason": (
                             f"query='{cand['query']}' "
                             f"title_sim={cand['title_sim']:.2f} "
@@ -354,7 +385,7 @@ class SpotifyScraperFetcher(BaseFetcher):
                         "rejected_count": len(rejected),
                     }
 
-                # Everything rejected → return None so fallback sources try
+                # Nothing passed
                 return None
 
         try:
